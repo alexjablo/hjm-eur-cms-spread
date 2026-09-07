@@ -1,4 +1,19 @@
+from typing import Callable, Tuple, Literal, List
+
+import numpy as np
+import pandas as pd
+
 import matplotlib.pyplot as plt
+import seaborn as sns
+
+from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
+
+from scipy.interpolate import PchipInterpolator
+from scipy.optimize import least_squares
+from scipy.stats import qmc
+from scipy.stats import norm
+
 def set_academic_style():
     """
     Configures Matplotlib global parameters to produce publication-quality,
@@ -47,8 +62,6 @@ def set_academic_style():
     # 7. Layout Optimization
     plt.rcParams['figure.autolayout'] = True
 
-from datetime import datetime, timedelta
-from dateutil.relativedelta import relativedelta
 def calculate_maturity(spot, tenor_str):
 
     tenor_str = str(tenor_str).upper().strip()
@@ -74,8 +87,6 @@ def calculate_maturity(spot, tenor_str):
         
     return mat
 
-import numpy as np
-import pandas as pd
 def bootstrap_ois_curve_act360(df_input, spot_date):
     """
     Bootstraps a discount curve using exact ACT/360 calendar logic.
@@ -165,7 +176,6 @@ def bootstrap_ois_curve_act360(df_input, spot_date):
     
     return results
 
-from scipy.interpolate import PchipInterpolator
 def forward_curve(df_bootstrapped, max_T=50.0, num_points=10000):
     """
     Takes the bootstrapped pillar nodes and generates a highly granular 
@@ -452,8 +462,6 @@ def hjm_objective_function(params, detailed_results, market_vols, use_vega=False
             
     return np.array(residuals)
 
-from scipy.optimize import least_squares
-from scipy.stats import qmc
 def calibration_1_lhs(bounds, detailed_results, market_target_vols, 
                          num_initial_guesses=50, use_vega=False):
     """
@@ -608,7 +616,6 @@ def plot_calibration_convergence(lhs_history, opt_result):
     plt.tight_layout()
     plt.show()
 
-import seaborn as sns
 def plot_calibration_error(market_target_vols, model_vols_equal, 
                                      model_vols_vega, expiry_prefix):
     """
@@ -767,45 +774,94 @@ def plot_calibration_error(market_target_vols, model_vols_equal,
     
     return error_metrics_summary
 
-def run_hjm_monte_carlo(kappa, sigma, T_expiry,
-                        T_10Y_cashflows, tau_10Y,
-                        T_2Y_cashflows, tau_2Y,
-                        P_0_func, f_0_func, strike,
-                        num_paths=100000, num_steps=100,
-                        discount_method='exact', seed=42):
+def run_hjm_mc(
+    kappa: np.ndarray, 
+    sigma: np.ndarray, 
+    T_expiry: float,
+    T_10Y_cashflows: np.ndarray, 
+    tau_10Y: np.ndarray,
+    T_2Y_cashflows: np.ndarray, 
+    tau_2Y: np.ndarray,
+    P_0_func: Callable[[float], float], 
+    f_0_func: Callable[[float], float], 
+    strike: float,
+    num_paths: int = 100000, 
+    num_steps: int = 100,
+    discount_method: Literal['exact', 'trapezoidal'] = 'exact', 
+    seed: int = 42
+) -> Tuple[float, float, np.ndarray]:
     """
-    Prices a 10Y-2Y CMS Spread Option.
-    discount_method: 'exact' (affine formula) or 'trapezoidal' (path integral)
+    Prices a 10Y-2Y CMS Spread Option using a multi-factor Markovian HJM framework.
+
+    Parameters
+    ----------
+    kappa : np.ndarray
+        Array of mean reversion speeds for each factor.
+    sigma : np.ndarray
+        Array of volatility scale parameters for each factor.
+    T_expiry : float
+        Time to option expiration in years.
+    T_10Y_cashflows : np.ndarray
+        Payment dates for the 10-year underlying swap.
+    tau_10Y : np.ndarray
+        Exact ACT/360 day count fractions for the 10-year swap.
+    T_2Y_cashflows : np.ndarray
+        Payment dates for the 2-year underlying swap.
+    tau_2Y : np.ndarray
+        Exact ACT/360 day count fractions for the 2-year swap.
+    P_0_func : Callable
+        Function returning the initial discount factor for a given maturity T.
+    f_0_func : Callable
+        Function returning the initial instantaneous forward rate for a given maturity T.
+    strike : float
+        The absolute strike rate of the spread option.
+    num_paths : int, default 100000
+        Number of Monte Carlo simulation paths.
+    num_steps : int, default 100
+        Number of discrete time steps for state variable propagation.
+    discount_method : {'exact', 'trapezoidal'}, default 'exact'
+        Method for computing the stochastic discount factor.
+    seed : int, default 42
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    Tuple[float, float, np.ndarray]
+        - Option premium (discounted expected payoff).
+        - Monte Carlo standard error.
+        - Array of realized terminal spreads across all paths.
     """
     rng = np.random.default_rng(seed)
-
-    kappa = np.asarray(kappa, dtype=float).reshape(3, 1)
-    sigma = np.asarray(sigma, dtype=float).reshape(3, 1)
+    
+    # Dynamically infer factor dimensionality
+    n_factors = len(kappa)
+    kappa = np.asarray(kappa, dtype=float).reshape(n_factors, 1)
+    sigma = np.asarray(sigma, dtype=float).reshape(n_factors, 1)
 
     dt = T_expiry / num_steps
 
-    def calc_Y(t):
+    # Pre-calculate deterministic state variables
+    def calc_Y(t: float) -> np.ndarray:
         return (sigma**2 / (2.0 * kappa)) * (1.0 - np.exp(-2.0 * kappa * t))
 
-    def calc_Psi(t):
+    def calc_Psi(t: float) -> np.ndarray:
         return (sigma**2 / (2.0 * kappa**2)) * (1.0 - np.exp(-kappa * t))**2
 
-    exp_k_dt  = np.exp(-kappa * dt)
-    Y_dt      = calc_Y(dt)
-    std_X_dt  = np.sqrt(Y_dt)
+    exp_k_dt = np.exp(-kappa * dt)
+    Y_dt     = calc_Y(dt)
+    std_X_dt = np.sqrt(Y_dt)
 
-    # State variables
-    X = np.zeros((3, num_paths))
+    # State variables initialization
+    X = np.zeros((n_factors, num_paths))
     
-    # Trapezoidal integration tracking
     integral_r = np.zeros(num_paths)
     if discount_method == 'trapezoidal':
-        r_curr = f_0_func(0.0) + 0.0 # X and Psi are 0 at t=0
+        r_curr = f_0_func(0.0) + 0.0 
 
-    # Phase 1: Time-stepping to T_expiry
+    # Phase 1: Time-stepping to T_expiry via exact transition density
     for k in range(num_steps):
         t_next = (k + 1) * dt
-        Z = rng.standard_normal((3, num_paths))
+        Z = rng.standard_normal((n_factors, num_paths))
         X = exp_k_dt * X + std_X_dt * Z
         
         if discount_method == 'trapezoidal':
@@ -829,31 +885,85 @@ def run_hjm_monte_carlo(kappa, sigma, T_expiry,
         raise ValueError("discount_method must be 'exact' or 'trapezoidal'")
 
     # Phase 3: Affine bond price reconstruction at T_expiry
-    def reconstruct_bond(T_k):
+    def reconstruct_bond(T_k: float) -> np.ndarray:
         B = -(1.0 - np.exp(-kappa * (T_k - T_expiry))) / kappa
         exponent = np.sum(B * (X + Psi_T) - 0.5 * (B**2) * Y_T, axis=0)
         return (P_0_func(T_k) / P_0_func(T_expiry)) * np.exp(exponent)
 
-    # 10Y Swap Reconstruction
+    # Swap Reconstruction
     P_10Y = np.array([reconstruct_bond(Tk) for Tk in T_10Y_cashflows])
     A_10Y = np.sum(tau_10Y[:, None] * P_10Y, axis=0)
     S_10Y = (1.0 - P_10Y[-1]) / A_10Y
 
-    # 2Y Swap Reconstruction
     P_2Y = np.array([reconstruct_bond(Tk) for Tk in T_2Y_cashflows])
     A_2Y = np.sum(tau_2Y[:, None] * P_2Y, axis=0)
     S_2Y = (1.0 - P_2Y[-1]) / A_2Y
 
     # Phase 4: Payoff and aggregation
-    spreads            = S_10Y - S_2Y
-    payoffs            = np.maximum(spreads - strike, 0.0)
+    spreads = S_10Y - S_2Y
+    payoffs = np.maximum(spreads - strike, 0.0)
     discounted_payoffs = payoffs * stochastic_discount
 
     mc_price   = float(np.mean(discounted_payoffs))
     mc_std_err = float(np.std(discounted_payoffs) / np.sqrt(num_paths))
 
     return mc_price, mc_std_err, spreads
-
+def plot_mc_distribution(
+    simulated_spreads: np.ndarray, 
+    strike_bps: float, 
+    discount_method: str,
+    num_paths: int,
+    num_steps: int,
+    T_expiry: float,
+    export_prefix: str = "cms_spread"
+):
+    """
+    Plots the empirical Monte Carlo distribution of the terminal CMS spread 
+    against a fitted Normal distribution, with simulation parameters in the legend.
+    """
+    spreads_bps = simulated_spreads * 10000.0
+    mu_empirical = np.mean(spreads_bps)
+    std_empirical = np.std(spreads_bps)
+    
+    fig, ax = plt.subplots(figsize=(10, 6), dpi=500)
+    
+    # Academic Colors
+    color_hist = '#1a365d'  # Slate Blue
+    color_strike = '#9b2c2c'  # Muted Crimson
+    
+    # Plot empirical histogram
+    ax.hist(spreads_bps, bins=100, density=True, alpha=0.75, 
+            color=color_hist, edgecolor='white', linewidth=0.5, 
+            label='MC Empirical Distribution')
+    
+    # Plot fitted Normal distribution
+    x_axis = np.linspace(mu_empirical - 4*std_empirical, mu_empirical + 4*std_empirical, 1000)
+    ax.plot(x_axis, norm.pdf(x_axis, mu_empirical, std_empirical), 
+            color='black', lw=2, linestyle='--', label='Fitted Normal Distribution')
+    
+    # Highlight the strike
+    ax.axvline(strike_bps, color=color_strike, lw=2, linestyle='-', label=f'Strike ({strike_bps:.0f} bps)')
+    
+    # Formatting
+    ax.set_title(f"CMS Spread (10Y - 2Y) Distribution at Expiry ({T_expiry})| Method: {discount_method.title()}", 
+                 fontsize=13, fontweight='bold', pad=15)
+    ax.set_xlabel("Realized Spread (Basis Points)", fontsize=11)
+    ax.set_ylabel("Probability Density", fontsize=11)
+    
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(True, alpha=0.3, linestyle='--')
+    
+    # Create the metadata legend title
+    legend_meta = f"Paths: {num_paths:,}\nSteps: {num_steps:,}"
+    
+    leg = ax.legend(title=legend_meta, fontsize=10, title_fontsize=10, 
+                    frameon=True, facecolor='white', edgecolor='none')
+    leg.get_title().set_fontweight('bold')
+    
+    plt.tight_layout()
+    # plt.savefig(f"{export_prefix}_distribution.pdf", format="pdf", dpi=500, bbox_inches='tight')
+    plt.show()
 def run_hjm_monte_carlo_paths(kappa, sigma, T_expiry,
                               T_10Y_cashflows, tau_10Y,
                               T_2Y_cashflows, tau_2Y,
@@ -956,28 +1066,72 @@ def run_hjm_monte_carlo_paths(kappa, sigma, T_expiry,
 
     return mc_price, mc_std_err, spread_paths
 
-def run_martingale_test(kappa, sigma, T_test, P_0_func, f_0_func,
-                        num_paths=100000, num_steps=100, 
-                        discount_method='exact', seed=42):
+def run_martingale_test(
+    kappa: np.ndarray, 
+    sigma: np.ndarray, 
+    T_test: float, 
+    P_0_func: Callable[[float], float], 
+    f_0_func: Callable[[float], float],
+    num_paths: int = 100000, 
+    num_steps: int = 100, 
+    discount_method: Literal['exact', 'trapezoidal'] = 'exact', 
+    seed: int = 42
+) -> Tuple[np.ndarray, np.ndarray, float, float]:
     """
-    Validates E[B(t)^{-1} * P(t,T)] = P(0,T).
+    Validates the Martingale property E[B(t)^{-1} * P(t,T)] = P(0,T) to ensure the 
+    absence of structural arbitrage leakage in the simulation engine.
+
+    Parameters
+    ----------
+    kappa : np.ndarray
+        Array of mean reversion speeds.
+    sigma : np.ndarray
+        Array of volatility scale parameters.
+    T_test : float
+        Maturity of the zero-coupon bond being tested.
+    P_0_func : Callable
+        Function returning the initial market discount factor for a given maturity.
+    f_0_func : Callable
+        Function returning the initial instantaneous forward rate for a given maturity.
+    num_paths : int, default 100000
+        Number of Monte Carlo simulation paths.
+    num_steps : int, default 100
+        Number of discrete time steps for state variable propagation.
+    discount_method : {'exact', 'trapezoidal'}, default 'exact'
+        Method for computing the stochastic discount factor.
+    seed : int, default 42
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    Tuple[np.ndarray, np.ndarray, float, float]
+        - time_grid: Array of simulation time steps.
+        - error_bps: Array of pricing errors at each step in basis points.
+        - theoretical_noise: 1-sigma standard error of the terminal simulation in bps.
+        - target_P0: The analytical P(0, T_test) market benchmark.
     """
     rng = np.random.default_rng(seed)
-    kappa = np.asarray(kappa, dtype=float).reshape(3, 1)
-    sigma = np.asarray(sigma, dtype=float).reshape(3, 1)
+    
+    # Dynamically infer factor dimensionality
+    n_factors = len(kappa)
+    kappa = np.asarray(kappa, dtype=float).reshape(n_factors, 1)
+    sigma = np.asarray(sigma, dtype=float).reshape(n_factors, 1)
 
     dt = T_test / num_steps
     time_grid = np.linspace(0, T_test, num_steps + 1)
 
-    def calc_Y(t): return (sigma**2 / (2.0*kappa)) * (1.0 - np.exp(-2.0*kappa*t))
-    def calc_Psi(t): return (sigma**2 / (2.0*kappa**2)) * (1.0 - np.exp(-kappa*t))**2
+    def calc_Y(t: float) -> np.ndarray: 
+        return (sigma**2 / (2.0 * kappa)) * (1.0 - np.exp(-2.0 * kappa * t))
+        
+    def calc_Psi(t: float) -> np.ndarray: 
+        return (sigma**2 / (2.0 * kappa**2)) * (1.0 - np.exp(-kappa * t))**2
 
     Y_dt = calc_Y(dt)
     std_X_dt = np.sqrt(Y_dt)
     exp_k_dt = np.exp(-kappa * dt)
 
     target_P0 = P_0_func(T_test)
-    X = np.zeros((3, num_paths))
+    X = np.zeros((n_factors, num_paths))
     
     integral_r = np.zeros(num_paths)
     if discount_method == 'trapezoidal':
@@ -987,7 +1141,7 @@ def run_martingale_test(kappa, sigma, T_test, P_0_func, f_0_func,
 
     for k in range(num_steps):
         t_next = (k + 1) * dt
-        Z = rng.standard_normal((3, num_paths))
+        Z = rng.standard_normal((n_factors, num_paths))
         X = exp_k_dt * X + std_X_dt * Z
 
         Y_next   = calc_Y(t_next)
@@ -1011,42 +1165,314 @@ def run_martingale_test(kappa, sigma, T_test, P_0_func, f_0_func,
         mc_expected_values.append(float(np.mean(discounted_bond)))
 
     error_bps = (np.array(mc_expected_values) - target_P0) * 10000.0
-    theoretical_noise = theoretical_noise = np.std(discounted_bond) / np.sqrt(num_paths) * 10000.0
+    theoretical_noise = np.std(discounted_bond) / np.sqrt(num_paths) * 10000.0
 
-    print(f"\n--- Martingale Test Results ({discount_method.upper()} Method) ---")
-    print(f"Target P(0, {T_test:.2f}) : {target_P0:.6f}")
-    print(f"Max absolute error : {np.max(np.abs(error_bps)):.4f} bps")
-    print(f"Mean error         : {np.mean(error_bps[1:]):.4f} bps")
-    print(f"Theoretical noise  : ±{theoretical_noise:.4f} bps (1σ)")
+    return time_grid, error_bps, theoretical_noise, target_P0
+def plot_martingale_test(
+    time_grid: np.ndarray, 
+    error_bps: np.ndarray, 
+    theoretical_noise: float, 
+    T_test: float, 
+    discount_method: str,
+    num_paths: int,
+    num_steps: int
+):
+    """
+    Visualizes the time-series evolution and terminal distribution of the Martingale error,
+    including simulation metadata in the legend.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), dpi=500)
+    fig.suptitle(f"Martingale Test: $E[B(t)^{{-1}} P(t,{T_test:.1f})]$ vs $P(0,{T_test:.1f})$", 
+                 fontsize=13, fontweight='bold', y=1.02)
 
-    # Plotting
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5), dpi = 500)
-    fig.suptitle(f"Martingale Test: $E[B(t)^{{-1}} P(t,{T_test:.1f})]$ vs $P(0,{T_test:.1f})$", fontsize=12)
+    color_primary = '#1a365d'  # Slate Blue
+    color_bound = '#9b2c2c'    # Muted Crimson
+    
+    # Define the metadata legend title
+    legend_meta = f"Paths: {num_paths:,}\nSteps: {num_steps:,}"
 
-    axes[0].plot(time_grid, error_bps, color='#185FA5', lw=1.5, label='MC error')
+    # ==========================================================
+    # Left Panel: Time-series error drift
+    # ==========================================================
+    axes[0].plot(time_grid, error_bps, color=color_primary, lw=1.5, label='MC error')
     axes[0].axhline(0, color='black', ls='--', lw=1.2)
-    axes[0].axhline(+theoretical_noise, color='red', ls=':', lw=1.0, label=f'+1σ noise ({theoretical_noise:.1f}bp)')
-    axes[0].axhline(-theoretical_noise, color='red', ls=':', lw=1.0)
+    axes[0].axhline(+theoretical_noise, color=color_bound, ls=':', lw=1.2, label=f'+1σ noise ({theoretical_noise:.1f} bp)')
+    axes[0].axhline(-theoretical_noise, color=color_bound, ls=':', lw=1.2)
+    
     axes[0].set_xlabel("Simulation time (years)")
     axes[0].set_ylabel("Error (bps)")
-    axes[0].legend(fontsize=9)
-    axes[0].grid(True, alpha=0.3)
-
-    axes[1].hist(error_bps[1:], bins=20, color='#185FA5', alpha=0.7, edgecolor='white')
+    
+    leg_0 = axes[0].legend(title=legend_meta, fontsize=9, title_fontsize=9, 
+                           frameon=True, facecolor='white', edgecolor='none')
+    leg_0.get_title().set_fontweight('bold')
+    
+    # ==========================================================
+    # Right Panel: Error Distribution
+    # ==========================================================
+    terminal_errors = error_bps[1:]
+    mean_error = np.mean(terminal_errors)
+    
+    axes[1].hist(terminal_errors, bins=20, color=color_primary, alpha=0.75, edgecolor='white')
     axes[1].axvline(0, color='black', ls='--', lw=1.2)
-    axes[1].axvline(np.mean(error_bps[1:]), color='red', ls='-', lw=1.5, label=f'Mean = {np.mean(error_bps[1:]):.3f} bp')
+    axes[1].axvline(mean_error, color=color_bound, ls='-', lw=1.5, label=f'Mean = {mean_error:.3f} bp')
+    
     axes[1].set_xlabel("Error (bps)")
     axes[1].set_ylabel("Frequency")
-    axes[1].legend(fontsize=9)
-    axes[1].grid(True, alpha=0.3)
+    
+    leg_1 = axes[1].legend(title=legend_meta, fontsize=9, title_fontsize=9, 
+                           frameon=True, facecolor='white', edgecolor='none')
+    leg_1.get_title().set_fontweight('bold')
+    
+    # Global formatting
+    for ax in axes:
+        ax.grid(True, alpha=0.3, linestyle='--')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
 
     plt.tight_layout()
-    plt.savefig(f'martingale_test_{discount_method}.pdf', dpi=500, bbox_inches='tight')
+    # plt.savefig(f'martingale_test_{discount_method}.pdf', dpi=500, bbox_inches='tight')
     plt.show()
 
-    return time_grid, error_bps
+def mc_convergence(
+    kappa: np.ndarray, 
+    sigma: np.ndarray, 
+    T_test: float, 
+    P_0_func: Callable[[float], float], 
+    f_0_func: Callable[[float], float],
+    path_grid: List[int] = [10000, 25000, 50000, 100000, 250000, 500000],
+    step_grid: List[int] = [50, 100, 200, 500, 1000, 2000],
+    discount_method: Literal['exact', 'trapezoidal'] = 'trapezoidal',
+    seed: int = 42
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Evaluates the discretisation bias and statistical convergence of the Monte Carlo engine.
+    
+    Returns two DataFrames:
+    - step_results: Tracks terminal error as integration steps increase.
+    - path_results: Tracks standard error as the number of paths increases.
+    """
+    anchor_paths = 100000
+    anchor_steps = int(T_test * 200)
+    
+    step_results = []
+    path_results = []
 
-from scipy.stats import norm
+    print("--- Running Step Convergence (Isolating Discretisation Bias) ---")
+    for steps in step_grid:
+        _, error_bps, _, _ = run_martingale_test(
+            kappa=kappa, sigma=sigma, T_test=T_test, 
+            P_0_func=P_0_func, f_0_func=f_0_func,
+            num_paths=anchor_paths, num_steps=steps, 
+            discount_method=discount_method, seed=seed
+        )
+        step_results.append({
+            "Steps": steps,
+            "dt": T_test / steps,
+            "Terminal Error (bps)": np.mean(error_bps[1:])
+        })
+
+    print("--- Running Path Convergence (Isolating Statistical Noise) ---")
+    for paths in path_grid:
+        _, _, std_error_bps, _ = run_martingale_test(
+            kappa=kappa, sigma=sigma, T_test=T_test, 
+            P_0_func=P_0_func, f_0_func=f_0_func,
+            num_paths=paths, num_steps=anchor_steps, 
+            discount_method=discount_method, seed=seed
+        )
+        path_results.append({
+            "Paths": paths,
+            "Standard Error (bps)": std_error_bps
+        })
+
+    return pd.DataFrame(step_results), pd.DataFrame(path_results)
+def plot_mc_convergence(
+    step_df: pd.DataFrame, 
+    path_df: pd.DataFrame, 
+    T_test: float, 
+    export_prefix: str = "mc_convergence"
+):
+    """
+    Generates a dual-panel publication-ready convergence plot.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), dpi=500)
+    fig.suptitle(f"Monte Carlo Engine Convergence Analysis (T = {T_test} Years)", 
+                 fontsize=13, fontweight='bold', y=1.02)
+
+    color_primary = '#1a365d'  # Slate Blue
+    color_theoretical = '#9b2c2c' # Muted Crimson
+
+    # ==========================================================
+    # LEFT PANEL: Discretisation Bias (Step Convergence)
+    # ==========================================================
+    axes[0].plot(step_df["Steps"], step_df["Terminal Error (bps)"], 
+                 marker='o', markersize=6, color=color_primary, lw=2, label="Trapezoidal Bias")
+    axes[0].axhline(0, color='black', ls='--', lw=1.2)
+    
+    axes[0].set_xscale('log')
+    axes[0].set_xticks(step_df["Steps"])
+    axes[0].set_xticklabels(step_df["Steps"])
+    
+    axes[0].set_xlabel("Number of Time Steps (Log Scale)")
+    axes[0].set_ylabel("Terminal Pricing Error (bps)")
+    axes[0].set_title("Integration Grid Resolution vs. Bias", fontsize=11)
+    axes[0].legend(frameon=True, facecolor='white', edgecolor='none')
+
+    # ==========================================================
+    # RIGHT PANEL: Statistical Variance (Path Convergence)
+    # ==========================================================
+    paths = path_df["Paths"].values
+    empirical_se = path_df["Standard Error (bps)"].values
+    
+    # Fit theoretical 1/sqrt(N) curve anchored to the first data point
+    c_constant = empirical_se[0] * np.sqrt(paths[0])
+    theoretical_se = c_constant / np.sqrt(paths)
+
+    axes[1].plot(paths, empirical_se, marker='o', markersize=6, 
+                 color=color_primary, lw=2, label="Empirical MC Standard Error")
+    axes[1].plot(paths, theoretical_se, color=color_theoretical, ls='--', 
+                 lw=2, label=r"Theoretical $O(1/\sqrt{N})$ Decay")
+    
+    axes[1].set_xlabel("Number of Simulated Paths")
+    axes[1].set_ylabel("Standard Error (bps)")
+    axes[1].set_title("Simulation Scale vs. Statistical Noise", fontsize=11)
+    
+    # Format x-axis to show "100k" instead of "100000" for clean readability
+    axes[1].xaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{int(x/1000)}k' if x > 0 else '0'))
+    axes[1].legend(frameon=True, facecolor='white', edgecolor='none')
+
+    # Global Formatting
+    for ax in axes:
+        ax.grid(True, alpha=0.3, linestyle='--')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+
+    plt.tight_layout()
+    # plt.savefig(f'{export_prefix}.pdf', dpi=500, bbox_inches='tight')
+    plt.show()
+
+def mc_convergence_cms(
+    kappa: np.ndarray, 
+    sigma: np.ndarray, 
+    T_expiry: float,
+    T_10Y_cashflows: np.ndarray, 
+    tau_10Y: np.ndarray,
+    T_2Y_cashflows: np.ndarray, 
+    tau_2Y: np.ndarray,
+    P_0_func: Callable[[float], float], 
+    f_0_func: Callable[[float], float], 
+    strike: float,
+    path_grid: List[int] = [10000, 25000, 50000, 100000, 250000],
+    step_grid: List[int] = [100, 200, 500, 1000, 2000, 4000],
+    discount_method: Literal['exact', 'trapezoidal'] = 'trapezoidal',
+    seed: int = 42
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Evaluates the discretisation stability and statistical convergence of the 
+    CMS Spread Option pricing engine.
+    """
+    anchor_paths = 100000
+    anchor_steps = int(T_expiry * 200) 
+    
+    step_results = []
+    path_results = []
+
+    print("--- Running Step Convergence (Isolating Discretisation Stability) ---")
+    for steps in step_grid:
+        mc_price, _, _ = run_hjm_mc(
+            kappa=kappa, sigma=sigma, T_expiry=T_expiry,
+            T_10Y_cashflows=T_10Y_cashflows, tau_10Y=tau_10Y,
+            T_2Y_cashflows=T_2Y_cashflows, tau_2Y=tau_2Y,
+            P_0_func=P_0_func, f_0_func=f_0_func, strike=strike,
+            num_paths=anchor_paths, num_steps=steps, 
+            discount_method=discount_method, seed=seed
+        )
+        step_results.append({
+            "Steps": steps,
+            "dt": T_expiry / steps,
+            "Option Premium (bps)": mc_price * 10000.0
+        })
+
+    print("--- Running Path Convergence (Isolating Statistical Noise) ---")
+    for paths in path_grid:
+        _, mc_std_err, _ = run_hjm_mc(
+            kappa=kappa, sigma=sigma, T_expiry=T_expiry,
+            T_10Y_cashflows=T_10Y_cashflows, tau_10Y=tau_10Y,
+            T_2Y_cashflows=T_2Y_cashflows, tau_2Y=tau_2Y,
+            P_0_func=P_0_func, f_0_func=f_0_func, strike=strike,
+            num_paths=paths, num_steps=anchor_steps, 
+            discount_method=discount_method, seed=seed
+        )
+        path_results.append({
+            "Paths": paths,
+            "Standard Error (bps)": mc_std_err * 10000.0
+        })
+
+    return pd.DataFrame(step_results), pd.DataFrame(path_results)
+def plot_mc_convergence_cms(
+    step_df: pd.DataFrame, 
+    path_df: pd.DataFrame, 
+    T_expiry: float, 
+    strike_bps: float,
+    export_prefix: str = "cms_convergence"
+):
+    """
+    Generates a dual-panel convergence plot for the CMS Spread exotic pricing engine.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), dpi=500)
+    fig.suptitle(f"CMS Spread Option Convergence (Expiry = {T_expiry}Y, Strike = {strike_bps} bps)", 
+                 fontsize=13, fontweight='bold', y=1.02)
+
+    color_primary = '#1a365d'  # Slate Blue
+    color_theoretical = '#9b2c2c' # Muted Crimson
+
+    # ==========================================================
+    # LEFT PANEL: Discretisation Stability (Step Convergence)
+    # ==========================================================
+    axes[0].plot(step_df["Steps"], step_df["Option Premium (bps)"], 
+                 marker='o', markersize=6, color=color_primary, lw=2, label="MC Premium")
+    
+    axes[0].set_xscale('log')
+    axes[0].set_xticks(step_df["Steps"])
+    axes[0].set_xticklabels(step_df["Steps"])
+    
+    axes[0].set_xlabel("Number of Time Steps (Log Scale)")
+    axes[0].set_ylabel("Option Premium (bps)")
+    axes[0].set_title("Integration Grid Resolution vs. Premium Stability", fontsize=11)
+    axes[0].legend(frameon=True, facecolor='white', edgecolor='none')
+
+    # ==========================================================
+    # RIGHT PANEL: Statistical Variance (Path Convergence)
+    # ==========================================================
+    paths = path_df["Paths"].values
+    empirical_se = path_df["Standard Error (bps)"].values
+    
+    # Fit theoretical 1/sqrt(N) curve anchored to the first data point
+    c_constant = empirical_se[0] * np.sqrt(paths[0])
+    theoretical_se = c_constant / np.sqrt(paths)
+
+    axes[1].plot(paths, empirical_se, marker='o', markersize=6, 
+                 color=color_primary, lw=2, label="Empirical MC Standard Error")
+    axes[1].plot(paths, theoretical_se, color=color_theoretical, ls='--', 
+                 lw=2, label=r"Theoretical $O(1/\sqrt{N})$ Decay")
+    
+    axes[1].set_xlabel("Number of Simulated Paths")
+    axes[1].set_ylabel("Standard Error (bps)")
+    axes[1].set_title("Simulation Scale vs. Statistical Noise", fontsize=11)
+    
+    # Format x-axis for readability
+    axes[1].xaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{int(x/1000)}k' if x > 0 else '0'))
+    axes[1].legend(frameon=True, facecolor='white', edgecolor='none')
+
+    # Global Formatting
+    for ax in axes:
+        ax.grid(True, alpha=0.3, linestyle='--')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+
+    plt.tight_layout()
+    # plt.savefig(f'{export_prefix}.pdf', dpi=500, bbox_inches='tight')
+    plt.show()
+
 def price_analytical_cms_spread(cell_data_10Y, cell_data_2Y, kappa, sigma, strike, option_type='call'):
     """
     Prices a CMS Spread Option (10Y - 2Y) analytically using the HJM frozen-drift 
